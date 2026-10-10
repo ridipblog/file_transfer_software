@@ -15,5 +15,8 @@
    run_sender.command (or bash run_sender.command)
    run_receiver.command (or bash run_receiver.command)
 
-6. Build Mac Standalone Executable (on a Mac):
-   bash build_mac.sh
+7. Launch GUI Application:
+   py gui_app.py (or double-click gui_app.exe or run_gui.bat)
+
+8. Generate Standalone GUI EXE (No console window):
+   py -m PyInstaller --noconsole --onefile --clean --name gui_app gui_app.py

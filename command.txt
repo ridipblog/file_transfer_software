@@ -5,8 +5,15 @@
 2. Start Receiver:
    py receiver.py --port 5001
 
-3. Generate Sender EXE:
+3. Generate Windows Sender EXE:
    py -m PyInstaller --onefile --clean --name sender sender.py
 
-4. Generate Receiver EXE:
+4. Generate Windows Receiver EXE:
    py -m PyInstaller --onefile --clean --name receiver receiver.py
+
+5. Run on macOS (Double-Click):
+   run_sender.command (or bash run_sender.command)
+   run_receiver.command (or bash run_receiver.command)
+
+6. Build Mac Standalone Executable (on a Mac):
+   bash build_mac.sh

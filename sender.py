@@ -224,6 +224,7 @@ def parse_host_port(host_str: str, default_port: int = DEFAULT_PORT):
 def interactive_mode():
     """
     Interactive terminal prompt for entering receiver IP and files.
+    Allows sending multiple files consecutively without closing.
     """
     print("=" * 60)
     print("            PYTHON SOCKET FILE SENDER (CLIENT)            ")
@@ -232,7 +233,7 @@ def interactive_mode():
     # 1. Receiver Host
     default_host = "127.0.0.1"
     host_input = input(
-        f"Enter Receiver IP / ngrok URL [e.g. 0.tcp.in.ngrok.io:10744 or press Enter for {default_host}]: "
+        f"Enter Receiver IP / ngrok / Pinggy URL [e.g. 0.tcp.in.ngrok.io:10744 or press Enter for {default_host}]: "
     ).strip()
 
     if not host_input:
@@ -253,21 +254,72 @@ def interactive_mode():
             print(f"[!] Invalid port, using default: {DEFAULT_PORT}")
             port = DEFAULT_PORT
 
-    # 3. File or Folder Path
-    while True:
-        target_path_input = input("\nEnter path to file or folder to send (or drag & drop here): ").strip()
-        cleaned_path = clean_input_path(target_path_input)
-        if not cleaned_path:
-            print("[!] Path cannot be empty.")
-            continue
-        
-        target_path = Path(cleaned_path).resolve()
-        if not target_path.exists():
-            print(f"[!] '{target_path}' not found! Please check path.")
-            continue
-        break
+    print(f"\n[*] Connecting to receiver at {host}:{port}...")
+    try:
+        sock = socket.create_connection((host, port), timeout=30)
+        sock.settimeout(None)
+        print("[+] Connected successfully!\n")
+    except socket.timeout:
+        print(f"[!] Connection timed out trying to reach {host}:{port}.")
+        print("    Please verify receiver is running and tunnel/port is correct.")
+        return
+    except Exception as e:
+        print(f"[!] Could not connect to {host}:{port} - {e}")
+        return
 
-    run_sender(host, port, [cleaned_path])
+    transferred_total = 0
+    try:
+        while True:
+            # 3. File or Folder Path
+            while True:
+                target_path_input = input("Enter path to file or folder to send (or drag & drop here) [or 'q' to quit]: ").strip()
+                if target_path_input.lower() in ("q", "quit", "exit"):
+                    try:
+                        send_packet(sock, {"action": "SESSION_END"})
+                    except Exception:
+                        pass
+                    return
+                cleaned_path = clean_input_path(target_path_input)
+                if not cleaned_path:
+                    print("[!] Path cannot be empty.\n")
+                    continue
+                
+                target_path = Path(cleaned_path).resolve()
+                if not target_path.exists():
+                    print(f"[!] '{target_path}' not found! Please check path.\n")
+                    continue
+                break
+
+            if target_path.is_dir():
+                transferred_total += send_folder(sock, target_path)
+            elif target_path.is_file():
+                if send_file(sock, target_path):
+                    transferred_total += 1
+
+            # Ask user if they want to send another file
+            print("=" * 60)
+            print(f"[✔] Total file(s) transferred so far: {transferred_total}")
+            print("=" * 60)
+            again = input("Do you want to send another file/folder? (y/n) [Default: y]: ").strip().lower()
+            if again in ("n", "no", "q", "exit"):
+                break
+            print()
+
+        # Send session end packet to notify receiver
+        try:
+            send_packet(sock, {"action": "SESSION_END"})
+        except Exception:
+            pass
+
+    except (ConnectionError, BrokenPipeError, socket.error) as e:
+        print(f"\n[!] Connection lost with receiver: {e}")
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+    print(f"\n[✔] Session finished. Total files sent: {transferred_total}")
 
 
 def main():
@@ -286,4 +338,16 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\nOperation cancelled by user.")
+    except Exception as e:
+        print(f"\n[!] Unexpected error: {e}")
+    finally:
+        # Prevent console window from auto-closing on Windows when double-clicked
+        if len(sys.argv) == 1:
+            try:
+                input("\nPress Enter to exit...")
+            except Exception:
+                pass

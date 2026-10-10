@@ -1,0 +1,12 @@
+
+1. For generate global url:
+   ssh -p 443 -R0:127.0.0.1:5001 tcp@a.pinggy.io
+
+2. Start Receiver:
+   py receiver.py --port 5001
+
+3. Generate Sender EXE:
+   py -m PyInstaller --onefile --clean --name sender sender.py
+
+4. Generate Receiver EXE:
+   py -m PyInstaller --onefile --clean --name receiver receiver.py

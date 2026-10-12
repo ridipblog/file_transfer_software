@@ -16,10 +16,14 @@ py -m PyInstaller --onefile --clean --name sender sender.py
 echo [*] Compiling receiver.exe...
 py -m PyInstaller --onefile --clean --name receiver receiver.py
 
+echo [*] Compiling gui_app.exe (Windowed GUI)...
+py -m PyInstaller --noconsole --onefile --clean --name gui_app gui_app.py
+
 echo.
 echo [*] Copying executables to current folder...
 copy /y dist\sender.exe .\sender.exe
 copy /y dist\receiver.exe .\receiver.exe
+copy /y dist\gui_app.exe .\gui_app.exe
 
 echo.
 echo [✔] Done! Both sender.exe and receiver.exe have been created.

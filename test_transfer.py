@@ -117,12 +117,97 @@ def run_all_tests():
     assert calculate_sha256(str(recv_nested)) == orig_nested_hash, "Checksum mismatch for nested file"
     print(" [✔] subfolder/nested_doc.txt: PASS (Relative path preserved, Checksum match)")
 
-    print("\n[🎉] ALL TESTS PASSED SUCCESSFULLY!")
+    print("\n[🎉] Standard Transfer Tests Passed!")
+
+    # Test Resuming
+    test_resumable_transfer()
 
     # Cleanup test dirs
     shutil.rmtree(TEST_SEND_DIR, ignore_errors=True)
     shutil.rmtree(TEST_RECV_DIR, ignore_errors=True)
+    print("\n[🎉] ALL TESTS (INCLUDING RESUME) PASSED SUCCESSFULLY!")
     print("[*] Cleaned up temporary test artifacts.")
+
+
+def test_resumable_transfer():
+    print("\n" + "=" * 50)
+    print("      TESTING INTERRUPTED & RESUMABLE TRANSFER")
+    print("=" * 50)
+
+    from protocol import send_packet, recv_packet
+
+    resume_send = TEST_SEND_DIR / "large_resume_file.bin"
+    test_data = os.urandom(512 * 1024)  # 512 KB
+    resume_send.write_bytes(test_data)
+    expected_hash = calculate_sha256(str(resume_send))
+    filesize = len(test_data)
+    half_size = filesize // 2
+
+    # 1. Start server for session 1
+    server_ready = threading.Event()
+    stop_event = threading.Event()
+    server_thread = threading.Thread(target=run_test_server, args=(server_ready, stop_event), daemon=True)
+    server_thread.start()
+    server_ready.wait(timeout=5)
+    time.sleep(0.2)
+
+    # 2. Simulate client sending only 50% (256 KB) and then abruptly closing socket!
+    print(f"[*] Simulating client sending 50% ({half_size} bytes) and disconnecting...")
+    s1 = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s1.connect(("127.0.0.1", TEST_PORT))
+    send_packet(s1, {
+        "action": "TRANSFER_FILE",
+        "filename": "large_resume_file.bin",
+        "filesize": filesize,
+        "checksum": expected_hash,
+        "relative_path": ""
+    })
+    ack1 = recv_packet(s1)
+    assert ack1.get("status") == "READY", f"Expected READY, got {ack1}"
+    assert ack1.get("offset") == 0
+
+    # Send only first 256 KB
+    s1.sendall(test_data[:half_size])
+    time.sleep(0.3)
+    # Abruptly close socket (simulate system shutdown / crash)
+    s1.close()
+
+    stop_event.set()
+    server_thread.join(timeout=3)
+
+    # Verify that .part file was preserved on receiver disk
+    part_file = TEST_RECV_DIR / "large_resume_file.bin.part"
+    assert part_file.exists(), "Expected .part file to be preserved after disconnect!"
+    part_size = part_file.stat().st_size
+    assert part_size >= half_size, f"Expected at least {half_size} bytes in .part file, got {part_size}"
+    print(f" [✔] Partial .part file preserved: {part_size} bytes ({part_size/filesize*100:.1f}%)")
+
+    # 3. Start server for session 2 (reconnection)
+    print("\n[*] Reconnecting to RESUME remaining 50%...")
+    server_ready2 = threading.Event()
+    stop_event2 = threading.Event()
+    server_thread2 = threading.Thread(target=run_test_server, args=(server_ready2, stop_event2), daemon=True)
+    server_thread2.start()
+    server_ready2.wait(timeout=5)
+    time.sleep(0.2)
+
+    # Use standard sender.run_sender to resume
+    sender.run_sender(
+        host="127.0.0.1",
+        port=TEST_PORT,
+        items_to_send=[str(resume_send)]
+    )
+
+    stop_event2.set()
+    server_thread2.join(timeout=3)
+
+    # Verify that .part file was completed and renamed to large_resume_file.bin
+    final_file = TEST_RECV_DIR / "large_resume_file.bin"
+    assert final_file.exists(), f"Final file {final_file} missing!"
+    assert not part_file.exists(), "Temporary .part file was not cleaned up!"
+    actual_hash = calculate_sha256(str(final_file))
+    assert actual_hash == expected_hash, f"Hash mismatch after resume! Expected {expected_hash}, got {actual_hash}"
+    print(f" [✔] RESUMABLE TRANSFER TEST: PASS (Resumed from 50%, 100% verified!)")
 
 
 if __name__ == "__main__":

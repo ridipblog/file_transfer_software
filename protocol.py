@@ -145,15 +145,17 @@ def format_bytes(size: float) -> str:
 class ProgressBar:
     """
     Terminal progress bar displaying transfer status, percentage, speed, and ETA.
+    Supports resumed transfers starting from initial_bytes.
     """
-    def __init__(self, total_bytes: int, title: str = "Transferring", width: int = 30):
+    def __init__(self, total_bytes: int, title: str = "Transferring", width: int = 30, initial_bytes: int = 0):
         self.total_bytes = max(total_bytes, 1)
-        self.transferred = 0
+        self.initial_bytes = max(0, min(initial_bytes, self.total_bytes))
+        self.transferred = self.initial_bytes
         self.title = title
         self.width = width
         self.start_time = time.time()
         self.last_update_time = self.start_time
-        self.last_bytes = 0
+        self.last_session_bytes = 0
         self.speed = 0.0
 
     def update(self, chunk_size: int):
@@ -163,11 +165,12 @@ class ProgressBar:
         
         # Recalculate speed every 0.25 seconds or at completion
         if elapsed_since_last >= 0.25 or self.transferred >= self.total_bytes:
-            bytes_diff = self.transferred - self.last_bytes
+            session_bytes = self.transferred - self.initial_bytes
+            bytes_diff = session_bytes - self.last_session_bytes
             if elapsed_since_last > 0:
                 self.speed = bytes_diff / elapsed_since_last
             self.last_update_time = now
-            self.last_bytes = self.transferred
+            self.last_session_bytes = session_bytes
             self.render()
 
     def render(self):
@@ -177,7 +180,8 @@ class ProgressBar:
         percent = fraction * 100.0
 
         elapsed_total = time.time() - self.start_time
-        overall_speed = self.transferred / max(elapsed_total, 0.001)
+        session_bytes = max(self.transferred - self.initial_bytes, 0)
+        overall_speed = session_bytes / max(elapsed_total, 0.001)
         display_speed = self.speed if self.speed > 0 else overall_speed
 
         remaining_bytes = max(self.total_bytes - self.transferred, 0)
@@ -197,5 +201,6 @@ class ProgressBar:
         self.render()
         sys.stdout.write("\n")
         total_time = max(time.time() - self.start_time, 0.001)
-        avg_speed = format_bytes(self.transferred / total_time) + "/s"
+        session_bytes = max(self.transferred - self.initial_bytes, 0)
+        avg_speed = format_bytes(session_bytes / total_time) + "/s"
         print(f"[*] {message} Time: {total_time:.2f}s (Avg Speed: {avg_speed})")

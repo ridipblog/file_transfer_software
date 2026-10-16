@@ -18,6 +18,7 @@ from protocol import (
     recv_packet,
     send_packet,
     format_bytes,
+    calculate_sha256,
     ProgressBar,
 )
 
@@ -88,28 +89,65 @@ def receive_single_file(client_sock: socket.socket, save_dir: Path, client_addr:
             target_dir.mkdir(parents=True, exist_ok=True)
             target_path = target_dir / clean_name
         else:
-            target_path = get_unique_filepath(save_dir, clean_name)
+            target_path = save_dir / clean_name
     else:
-        target_path = get_unique_filepath(save_dir, clean_name)
+        target_path = save_dir / clean_name
 
     print(f"\n[+] Incoming File: '{clean_name}'")
     print(f"    Size: {format_bytes(filesize)} ({filesize:,} bytes)")
     print(f"    Saving to: {target_path}")
 
-    # 2. Send acknowledgment ready packet
+    # 1. Check if complete file already exists with matching checksum
+    if target_path.exists() and target_path.stat().st_size == filesize:
+        if calculate_sha256(str(target_path)).lower() == expected_checksum.lower():
+            print(f"[✔] File is already completely downloaded and verified: '{clean_name}'")
+            send_packet(client_sock, {
+                "status": "ALREADY_EXISTS",
+                "offset": filesize,
+                "saved_to": str(target_path.resolve()),
+                "message": "File is already completely downloaded."
+            })
+            return True
+
+    # 2. Check for partial .part file for resuming
+    part_path = target_path.with_name(clean_name + ".part")
+    offset = 0
+    resumed = False
+
+    if part_path.exists():
+        part_size = part_path.stat().st_size
+        if 0 < part_size < filesize:
+            offset = part_size
+            resumed = True
+            percent = (offset / max(filesize, 1)) * 100.0
+            print(f"[⚡] Found partial file: '{part_path.name}' ({format_bytes(offset)})")
+            print(f"[⚡] Resuming download from offset: {format_bytes(offset)} ({percent:.1f}%)")
+        elif part_size >= filesize:
+            # Corrupted or oversized partial file - reset
+            try:
+                part_path.unlink()
+            except Exception:
+                pass
+
+    # 3. Send acknowledgment ready packet with offset
     try:
-        send_packet(client_sock, {"status": "READY", "message": "Ready to receive data."})
+        send_packet(client_sock, {
+            "status": "READY",
+            "offset": offset,
+            "resumed": resumed,
+            "message": "Ready to receive data."
+        })
     except Exception as e:
         print(f"[!] Failed to send ready acknowledgment: {e}")
         return False
 
-    # 3. Receive the file stream chunk by chunk
-    hasher = hashlib.sha256()
-    bytes_received = 0
-    progress = ProgressBar(filesize, title=f"Downloading {clean_name}")
+    # 4. Receive the file stream chunk by chunk (append if resuming)
+    file_mode = "ab" if offset > 0 else "wb"
+    bytes_received = offset
+    progress = ProgressBar(filesize, title=f"Downloading {clean_name}", initial_bytes=offset)
 
     try:
-        with open(target_path, "wb") as f:
+        with open(part_path, file_mode) as f:
             while bytes_received < filesize:
                 remaining = filesize - bytes_received
                 to_read = min(CHUNK_SIZE, remaining)
@@ -118,7 +156,6 @@ def receive_single_file(client_sock: socket.socket, save_dir: Path, client_addr:
                     raise ConnectionError("Connection was lost while receiving file stream.")
                 
                 f.write(chunk)
-                hasher.update(chunk)
                 bytes_received += len(chunk)
                 progress.update(len(chunk))
 
@@ -126,20 +163,26 @@ def receive_single_file(client_sock: socket.socket, save_dir: Path, client_addr:
     except Exception as e:
         sys.stdout.write("\n")
         print(f"[!] Error during file download: {e}")
-        if target_path.exists():
-            try:
-                target_path.unlink()
-                print("[-] Incomplete file removed.")
-            except Exception:
-                pass
-        send_packet(client_sock, {"status": "ERROR", "message": str(e)})
+        print(f"[*] Partial file preserved: '{part_path.name}' ({format_bytes(bytes_received)} / {format_bytes(filesize)}). Ready to resume later.")
+        try:
+            send_packet(client_sock, {"status": "ERROR", "message": str(e)})
+        except Exception:
+            pass
         return False
 
-    # 4. Verify SHA-256 Checksum
-    calculated_checksum = hasher.hexdigest()
+    # 5. Verify Full File SHA-256 Checksum
+    print(f"[*] Verifying SHA-256 checksum...")
+    calculated_checksum = calculate_sha256(str(part_path))
     checksum_match = (calculated_checksum.lower() == expected_checksum.lower())
 
     if checksum_match:
+        # Move .part to target_path atomically
+        if target_path.exists():
+            try:
+                target_path.unlink()
+            except Exception:
+                target_path = get_unique_filepath(target_path.parent, clean_name)
+        part_path.replace(target_path)
         print(f"[✔] Integrity check passed! SHA-256 verified: {calculated_checksum[:16]}...")
         print(f"[📂] File saved to: {target_path.resolve()}")
         send_packet(client_sock, {
@@ -152,6 +195,10 @@ def receive_single_file(client_sock: socket.socket, save_dir: Path, client_addr:
         print("[✖] Warning: Checksum MISMATCH!")
         print(f"    Expected:   {expected_checksum}")
         print(f"    Calculated: {calculated_checksum}")
+        try:
+            part_path.unlink()
+        except Exception:
+            pass
         send_packet(client_sock, {
             "status": "ERROR",
             "checksum_match": False,

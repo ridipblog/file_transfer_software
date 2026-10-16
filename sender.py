@@ -69,21 +69,34 @@ def send_file(sock: socket.socket, file_path: Path, relative_path: str = "") -> 
     # 2. Wait for receiver ready acknowledgment
     try:
         ack = recv_packet(sock)
-        if ack.get("status") != "READY":
+        status = ack.get("status")
+        if status == "ALREADY_EXISTS":
+            print(f"[✔] File is already completely transferred on receiver! Skipping upload: '{filename}'\n")
+            return True
+        elif status != "READY":
             print(f"[!] Receiver rejected transfer: {ack.get('message')}")
             return False
     except Exception as e:
         print(f"[!] Did not receive ready acknowledgment from receiver: {e}")
         return False
 
-    # 3. Stream file chunks
-    progress = ProgressBar(filesize, title=f"Uploading {filename}")
-    bytes_sent = 0
+    offset = ack.get("offset", 0)
+    if offset > 0:
+        percent = (offset / max(filesize, 1)) * 100.0
+        print(f"[⚡] Resuming upload from offset: {format_bytes(offset)} ({percent:.1f}%)")
+
+    # 3. Stream file chunks (seeking to offset if resuming)
+    progress = ProgressBar(filesize, title=f"Uploading {filename}", initial_bytes=offset)
+    bytes_sent = offset
 
     try:
         with open(file_path, "rb") as f:
+            if offset > 0:
+                f.seek(offset)
             while bytes_sent < filesize:
-                chunk = f.read(CHUNK_SIZE)
+                remaining = filesize - bytes_sent
+                to_read = min(CHUNK_SIZE, remaining)
+                chunk = f.read(to_read)
                 if not chunk:
                     break
                 sock.sendall(chunk)
@@ -158,6 +171,16 @@ def run_sender(host: str, port: int, items_to_send: list):
         sock = socket.create_connection((host, port), timeout=30)
         sock.settimeout(None)  # Reset to blocking mode for data transfer
         print("[+] Connected successfully!\n")
+    except socket.gaierror as e:
+        print(f"\n[!] DNS Address Resolution Error ({e}):")
+        print(f"    Cannot find or resolve host: '{host}'")
+        print("    ---------------------------------------------------------")
+        print("    Possible causes:")
+        print("    1. The Pinggy / ngrok URL has expired or was regenerated on the receiver.")
+        print("    2. Check for typos in the address or port.")
+        print("    3. Check your internet connection.")
+        print("    ---------------------------------------------------------\n")
+        return
     except socket.timeout:
         print(f"[!] Connection timed out trying to reach {host}:{port}.")
         print("    Please verify the receiver is running and Firewall allows port", port)
@@ -198,27 +221,32 @@ def run_sender(host: str, port: int, items_to_send: list):
 def parse_host_port(host_str: str, default_port: int = DEFAULT_PORT):
     """
     Intelligently parse host and port from various formats, such as:
-    - tcp://0.tcp.in.ngrok.io:10744
-    - 0.tcp.in.ngrok.io:10744
+    - tcp://xyz.run.pinggy-free.link:36523
+    - "0.tcp.in.ngrok.io:10744"
     - 192.168.1.15:5001
     - 192.168.1.15
     """
-    host_str = host_str.strip()
-    # Strip protocols if user pasted from ngrok
-    if host_str.startswith("tcp://"):
-        host_str = host_str[len("tcp://"):]
-    elif host_str.startswith("http://"):
-        host_str = host_str[len("http://"):]
+    host_str = host_str.strip().strip('"').strip("'").strip()
+    # Strip protocols if user pasted from ngrok, pinggy, etc.
+    for proto in ("tcp://", "http://", "https://", "ssh://"):
+        if host_str.lower().startswith(proto):
+            host_str = host_str[len(proto):]
+            break
+
+    # Strip any trailing slashes or URL paths
+    host_str = host_str.rstrip("/")
+    if "/" in host_str:
+        host_str = host_str.split("/")[0]
 
     if ":" in host_str:
-        parts = host_str.split(":", 1)
+        parts = host_str.rsplit(":", 1)
         host = parts[0].strip()
         try:
             port = int(parts[1].strip())
             return host, port
         except ValueError:
             return host, default_port
-    return host_str, None
+    return host_str.strip(), None
 
 
 def interactive_mode():
@@ -259,6 +287,16 @@ def interactive_mode():
         sock = socket.create_connection((host, port), timeout=30)
         sock.settimeout(None)
         print("[+] Connected successfully!\n")
+    except socket.gaierror as e:
+        print(f"\n[!] DNS Address Resolution Error ({e}):")
+        print(f"    Cannot find or resolve host: '{host}'")
+        print("    ---------------------------------------------------------")
+        print("    Possible causes:")
+        print("    1. The Pinggy / ngrok URL has expired or was regenerated on the receiver.")
+        print("    2. Check for typos in the address or port.")
+        print("    3. Check your internet connection.")
+        print("    ---------------------------------------------------------\n")
+        return
     except socket.timeout:
         print(f"[!] Connection timed out trying to reach {host}:{port}.")
         print("    Please verify receiver is running and tunnel/port is correct.")

@@ -777,26 +777,69 @@ class FileTransferGUI:
                             target_dir.mkdir(parents=True, exist_ok=True)
                             target_path = target_dir / filename
                         else:
-                            target_path = receiver.get_unique_filepath(save_dir, filename)
+                            target_path = save_dir / filename
                     else:
-                        target_path = receiver.get_unique_filepath(save_dir, filename)
+                        target_path = save_dir / filename
 
-                    self.log_recv(f"Receiving '{filename}' ({format_bytes(filesize)})...")
-                    send_packet(client_sock, {"status": "READY"})
+                    # 1. Check if complete file already exists
+                    if target_path.exists() and target_path.stat().st_size == filesize:
+                        if calculate_sha256(str(target_path)).lower() == expected_checksum.lower():
+                            self.log_recv(f"✔ File already fully downloaded: {filename}")
+                            send_packet(client_sock, {
+                                "status": "ALREADY_EXISTS",
+                                "offset": filesize,
+                                "saved_to": str(target_path.resolve())
+                            })
+                            count += 1
+                            continue
 
-                    hasher = hashlib.sha256()
-                    bytes_received = 0
-                    with open(target_path, "wb") as f:
+                    # 2. Check for partial .part file for resuming
+                    part_path = target_path.with_name(filename + ".part")
+                    offset = 0
+                    resumed = False
+                    if part_path.exists():
+                        part_size = part_path.stat().st_size
+                        if 0 < part_size < filesize:
+                            offset = part_size
+                            resumed = True
+                            pct = (offset / max(filesize, 1)) * 100.0
+                            self.log_recv(f"⚡ Resuming '{filename}' from {format_bytes(offset)} ({pct:.1f}%)...")
+                        elif part_size >= filesize:
+                            try:
+                                part_path.unlink()
+                            except Exception:
+                                pass
+
+                    if not resumed:
+                        self.log_recv(f"Receiving '{filename}' ({format_bytes(filesize)})...")
+
+                    send_packet(client_sock, {
+                        "status": "READY",
+                        "offset": offset,
+                        "resumed": resumed
+                    })
+
+                    file_mode = "ab" if offset > 0 else "wb"
+                    bytes_received = offset
+                    with open(part_path, file_mode) as f:
                         while bytes_received < filesize:
-                            chunk = client_sock.recv(min(CHUNK_SIZE, filesize - bytes_received))
+                            remaining = filesize - bytes_received
+                            chunk = client_sock.recv(min(CHUNK_SIZE, remaining))
                             if not chunk:
                                 raise ConnectionError("Connection lost mid-transfer.")
                             f.write(chunk)
-                            hasher.update(chunk)
                             bytes_received += len(chunk)
 
-                    calc_hash = hasher.hexdigest()
+                    # 3. Verify full file checksum
+                    self.log_recv(f"Verifying integrity for {filename}...")
+                    calc_hash = calculate_sha256(str(part_path))
                     if calc_hash.lower() == expected_checksum.lower():
+                        if target_path.exists():
+                            try:
+                                target_path.unlink()
+                            except Exception:
+                                target_path = receiver.get_unique_filepath(target_path.parent, filename)
+                        part_path.replace(target_path)
                         self.log_recv(f"✔ File verified & saved: {target_path.name}")
                         send_packet(client_sock, {
                             "status": "SUCCESS",
@@ -806,9 +849,16 @@ class FileTransferGUI:
                         count += 1
                     else:
                         self.log_recv(f"✖ Checksum mismatch for {filename}!")
+                        try:
+                            part_path.unlink()
+                        except Exception:
+                            pass
                         send_packet(client_sock, {"status": "ERROR", "checksum_match": False})
             except Exception as e:
-                self.log_recv(f"Transfer error: {e}")
+                self.log_recv(f"Transfer interrupted: {e}")
+                if 'part_path' in locals() and part_path.exists():
+                    saved_sz = part_path.stat().st_size
+                    self.log_recv(f"⚡ Partial file preserved ({format_bytes(saved_sz)}). Ready to resume.")
             finally:
                 try:
                     client_sock.close()
@@ -974,6 +1024,22 @@ class FileTransferGUI:
 
                 self.root.after(0, lambda: self._on_send_success(total_files_transferred))
 
+            except socket.gaierror as e:
+                err_msg = (
+                    f"Address Resolution Error ({e})\n\n"
+                    f"Cannot reach host: '{host}'\n\n"
+                    "Common reasons:\n"
+                    "1. The Pinggy or ngrok link expired or was restarted on the receiver. Look at the receiver app to get the latest link.\n"
+                    "2. Check for typos in the IP or link.\n"
+                    "3. Make sure your internet connection is active."
+                )
+                self.root.after(0, lambda msg=err_msg: self._on_send_failure(msg))
+            except socket.timeout:
+                err_msg = (
+                    f"Connection timed out reaching {host}:{port}.\n\n"
+                    "Please verify the receiver is running and firewall allows port {port}."
+                )
+                self.root.after(0, lambda msg=err_msg: self._on_send_failure(msg))
             except Exception as e:
                 self.root.after(0, lambda err=e: self._on_send_failure(err))
             finally:
@@ -1003,16 +1069,29 @@ class FileTransferGUI:
         send_packet(sock, metadata)
 
         ack = recv_packet(sock)
-        if ack.get("status") != "READY":
+        status = ack.get("status")
+        if status == "ALREADY_EXISTS":
+            self._update_progress_ui(100, f"✔ {filename} is already completely transferred on receiver.")
+            return True
+        elif status != "READY":
             raise RuntimeError(f"Receiver rejected transfer: {ack.get('message')}")
 
-        sent_bytes = 0
+        offset = ack.get("offset", 0)
+        sent_bytes = offset
         start_time = time.time()
         last_update = start_time
 
+        if offset > 0:
+            pct = (offset / max(filesize, 1)) * 100.0
+            self._update_progress_ui(pct, f"Resuming {filename} from {pct:.1f}% ({format_bytes(offset)})...")
+
         with open(file_path, "rb") as f:
+            if offset > 0:
+                f.seek(offset)
             while sent_bytes < filesize:
-                chunk = f.read(CHUNK_SIZE)
+                remaining = filesize - sent_bytes
+                to_read = min(CHUNK_SIZE, remaining)
+                chunk = f.read(to_read)
                 if not chunk:
                     break
                 sock.sendall(chunk)
@@ -1022,8 +1101,10 @@ class FileTransferGUI:
                 if now - last_update >= 0.2 or sent_bytes >= filesize:
                     pct = (sent_bytes / max(filesize, 1)) * 100.0
                     elapsed = max(now - start_time, 0.001)
-                    speed = sent_bytes / elapsed
-                    eta = max((filesize - sent_bytes) / max(speed, 1), 0)
+                    session_bytes = max(sent_bytes - offset, 0)
+                    speed = session_bytes / elapsed
+                    remaining_bytes = max(filesize - sent_bytes, 0)
+                    eta = max(remaining_bytes / max(speed, 1), 0)
                     stat_str = f"Sending {filename}: {pct:.1f}% | {format_bytes(sent_bytes)}/{format_bytes(filesize)} | {format_bytes(speed)}/s | ETA: {int(eta)}s"
                     self._update_progress_ui(pct, stat_str)
                     last_update = now
